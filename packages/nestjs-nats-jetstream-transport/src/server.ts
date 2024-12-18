@@ -8,6 +8,7 @@ import {
   SubscriptionOptions,
 } from 'nats';
 
+import { Client } from '@nestjs/microservices/external/nats-client.interface';
 import { from } from 'rxjs';
 import { NATS_JETSTREAM_TRANSPORT } from './constants';
 import { NatsJetStreamServerOptions } from './interfaces/nats-jetstream-server-options.interface';
@@ -19,9 +20,10 @@ export class NatsJetStreamServer
   implements CustomTransportStrategy
 {
   readonly transportId: symbol = NATS_JETSTREAM_TRANSPORT;
-  private nc: NatsConnection;
+  private nc: NatsConnection | undefined;
   private codec: Codec<JSON>;
   private jsm: JetStreamManager;
+  private cb: () => void;
 
   constructor(private options: NatsJetStreamServerOptions) {
     super();
@@ -29,24 +31,30 @@ export class NatsJetStreamServer
   }
 
   async listen(callback: () => void) {
-    if (!this.nc) {
-      this.nc = await connect(this.options.connectionOptions);
-      if (this.options.connectionOptions.connectedHook) {
-        this.options.connectionOptions.connectedHook(this.nc);
+    try {
+      if (!this.nc) {
+        this.nc = await connect(this.options.connectionOptions);
+        if (this.options.connectionOptions.connectedHook) {
+          this.options.connectionOptions.connectedHook(this.nc);
+        }
       }
-    }
-    this.jsm = await this.nc.jetstreamManager(this.options.jetStreamOptions);
-    if (this.options.streamConfig) {
-      await this.setupStream();
-    }
+      this.jsm = await this.nc.jetstreamManager(this.options.jetStreamOptions);
+      if (this.options.streamConfig) {
+        await this.setupStream();
+      }
 
-    await this.bindEventHandlers();
-    this.bindMessageHandlers();
-    callback();
+      await this.bindEventHandlers();
+      this.bindMessageHandlers();
+      this.handleStatusUpdates(this.nc as Client);
+      this.cb = callback;
+      callback();
+    } catch (err) {
+      this.logger.error(err);
+    }
   }
 
   async close() {
-    await this.nc.drain();
+    await this.nc?.drain();
     this.nc = undefined;
   }
 
@@ -146,6 +154,28 @@ export class NatsJetStreamServer
       } else {
         const streamInfo = await this.jsm.streams.add(streamCfg);
         this.logger.log(`Stream ${streamInfo.config.name} created`);
+      }
+    }
+  }
+
+  private async handleStatusUpdates(client: Client) {
+    for await (const status of client.status()) {
+      switch (status.type) {
+        case 'error':
+        case 'disconnect':
+          this.nc = undefined;
+          break;
+
+        case 'reconnect':
+          try {
+            await this.listen(this.cb);
+          } catch (err) {
+            this.logger.error(err);
+          }
+          break;
+
+        default:
+          break;
       }
     }
   }
